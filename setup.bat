@@ -45,9 +45,26 @@ echo  Control Center setup
 echo  Project: %INSTALL_DIR%
 echo.
 
-if exist "%NODE_HOME%\node.exe" goto NODE_OK
-if exist "%ProgramFiles%\nodejs\node.exe" set "NODE_HOME=%ProgramFiles%\nodejs" & goto NODE_OK
+set "PORTABLE_HOME=%LOCALAPPDATA%\ControlCenter-Runtime\node"
+set "NODE_HOME=%PORTABLE_HOME%"
 
+if exist "%PORTABLE_HOME%\node.exe" (
+    call :node_new_enough "%PORTABLE_HOME%"
+    if not errorlevel 1 goto NODE_OK
+    echo Portable Node is older than 24.19.0. Replacing it...
+)
+
+if exist "%ProgramFiles%\nodejs\node.exe" (
+    call :node_new_enough "%ProgramFiles%\nodejs"
+    if not errorlevel 1 (
+        set "NODE_HOME=%ProgramFiles%\nodejs"
+        goto NODE_OK
+    )
+    echo System Node is older than 24.19.0. Installing portable %NODE_VER%...
+)
+
+rem Incompatible binary may live under Program Files. Always install into the portable folder.
+set "NODE_HOME=%PORTABLE_HOME%"
 echo Downloading portable Node.js %NODE_VER%...
 set "ARCH=x64"
 if /i "%PROCESSOR_ARCHITECTURE%"=="ARM64" set "ARCH=arm64"
@@ -91,42 +108,70 @@ if exist "%SCRIPT_DIR%\start.bat" if /i not "%SCRIPT_DIR%"=="%INSTALL_DIR%" copy
 if exist "%SCRIPT_DIR%\REQUIREMENTS.md" if /i not "%SCRIPT_DIR%"=="%INSTALL_DIR%" copy /y "%SCRIPT_DIR%\REQUIREMENTS.md" "%INSTALL_DIR%\REQUIREMENTS.md" >nul
 echo Source ready.
 
-if exist "%LOCALAPPDATA%\Programs\Ollama\ollama.exe" set "PATH=%LOCALAPPDATA%\Programs\Ollama;%PATH%"
+set "PATH=%LOCALAPPDATA%\Programs\Ollama;%ProgramFiles%\Ollama;%PATH%"
 where ollama >nul 2>&1
 if errorlevel 1 (
-    echo Ollama not found. Dashboard will still run.
+    echo Installing Ollama...
+    where winget >nul 2>&1
+    if not errorlevel 1 winget install --id Ollama.Ollama -e --accept-package-agreements --accept-source-agreements
+    set "PATH=%LOCALAPPDATA%\Programs\Ollama;%ProgramFiles%\Ollama;%PATH%"
+)
+where ollama >nul 2>&1
+if errorlevel 1 (
+    echo Downloading OllamaSetup.exe...
+    curl.exe -L --fail -o "%TEMP%\OllamaSetup.exe" "https://ollama.com/download/OllamaSetup.exe"
+    if not errorlevel 1 "%TEMP%\OllamaSetup.exe" /VERYSILENT /NORESTART /SUPPRESSMSGBOXES
+    set "PATH=%LOCALAPPDATA%\Programs\Ollama;%ProgramFiles%\Ollama;%PATH%"
+)
+where ollama >nul 2>&1
+if errorlevel 1 (
+    echo Ollama could not be installed. Dashboard will still run.
     goto APP
 )
+
 curl.exe -s -m 2 "%OLLAMA_URL%/api/tags" >nul 2>&1
 if errorlevel 1 start "Ollama" /MIN cmd /c "ollama serve"
+timeout /t 3 /nobreak >nul
 
-set "MODEL="
+set "RAM_GB=16"
+set "PS=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
+if exist "%PS%" (
+    for /f "delims=" %%M in ('"%PS%" -NoProfile -Command "[int]((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory/1GB)"') do set "RAM_GB=%%M"
+)
+set "RECOMMENDED=qwen2.5:7b"
+if %RAM_GB% LSS 10 set "RECOMMENDED=gemma3:4b"
+if %RAM_GB% GEQ 20 set "RECOMMENDED=qwen2.5:14b"
+echo Detected about %RAM_GB% GB RAM
+echo Recommended model: %RECOMMENDED%
+
 if not "%PULL_MODEL%"=="" (
-    echo Downloading requested model %PULL_MODEL%...
-    ollama pull %PULL_MODEL%
     set "MODEL=%PULL_MODEL%"
 ) else (
-    echo Local Ollama models:
-    ollama list
-    for /f "skip=1 tokens=1" %%M in ('ollama ps 2^>nul') do if not defined MODEL set "MODEL=%%M"
-    if not defined MODEL for /f "skip=1 tokens=1" %%M in ('ollama list 2^>nul') do if not defined MODEL set "MODEL=%%M"
+    set "MODEL=%RECOMMENDED%"
 )
 
-if "%MODEL%"=="" (
-    echo No local model selected. Nothing will be downloaded.
-    echo Optional later:  ollama pull qwen2.5:7b
-    echo Or:              setup.bat /model=qwen2.5:7b
-    goto APP
+echo Local Ollama models:
+ollama list
+ollama list 2>nul | findstr /I /C:"%MODEL%" >nul
+if errorlevel 1 (
+    echo Downloading %MODEL% ...
+    ollama pull %MODEL%
+    if errorlevel 1 (
+        echo Could not download %MODEL%. Dashboard will still run.
+        goto APP
+    )
+) else (
+    echo %MODEL% is already installed. Skipping download.
 )
 
-echo Using existing model %MODEL%
-curl.exe -s -m 60 "%OLLAMA_URL%/api/generate" -H "Content-Type: application/json" -d "{\"model\":\"%MODEL%\",\"prompt\":\"ok\",\"stream\":false,\"keep_alive\":-1}" >nul 2>&1
-"%NODE_HOME%\node.exe" -e "const fs=require('fs'),path=require('path');const p=path.join(process.env.LOCALAPPDATA,'Control Center','settings.json');let s={};try{s=JSON.parse(fs.readFileSync(p,'utf8').replace(/^\uFEFF/,''))}catch(e){} s.ai=s.ai||{};s.ai.provider='ollama';s.ai.model=process.env.MODEL;s.ai.localBaseUrls=Object.assign({lmstudio:'http://127.0.0.1:1234',ollama:'http://127.0.0.1:11434'},s.ai.localBaseUrls||{});fs.mkdirSync(path.dirname(p),{recursive:true});fs.writeFileSync(p,JSON.stringify(s,null,2)+'\n');"
+echo Using model %MODEL%
+curl.exe -s -m 180 "%OLLAMA_URL%/api/generate" -H "Content-Type: application/json" -d "{\"model\":\"%MODEL%\",\"prompt\":\"ok\",\"stream\":false,\"keep_alive\":-1}" >nul 2>&1
+"%NODE_HOME%\node.exe" -e "const fs=require('fs'),path=require('path');const p=path.join(process.env.LOCALAPPDATA,'Control Center','settings.json');let s={};try{s=JSON.parse(fs.readFileSync(p,'utf8').[...]
 
 :APP
 cd /d "%INSTALL_DIR%"
 if exist "%DATA_DIR%\launcher.lock" del /f /q "%DATA_DIR%\launcher.lock" >nul 2>&1
-"%NODE_HOME%\node.exe" -e "const fs=require('fs'),p=require('path').join(process.env.LOCALAPPDATA,'Control Center','settings.json');if(!fs.existsSync(p))process.exit(0);const b=fs.readFileSync(p);if(b[0]===0xEF&&b[1]===0xBB&&b[2]===0xBF)fs.writeFileSync(p,b.subarray(3));"
+"%NODE_HOME%\node.exe" -e "const fs=require('fs'),p=require('path').join(process.env.LOCALAPPDATA,'Control Center','settings.json');if(!fs.existsSync(p))process.exit(0);const b=fs.readFileSync(p)[...]
 
 echo Installing app packages...
 call "%NODE_HOME%\npm.cmd" run setup
@@ -148,6 +193,10 @@ echo.
 echo Server stopped.
 pause
 exit /b 0
+
+:node_new_enough
+"%~1\node.exe" -e "const p=process.versions.node.split('.').map(Number);process.exit((p[0]>24||(p[0]===24&&p[1]>=19))?0:1)"
+exit /b %ERRORLEVEL%
 
 :FAIL
 echo.
